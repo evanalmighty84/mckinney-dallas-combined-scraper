@@ -39,6 +39,26 @@ const MAX_POSTS_PER_TERM = Number(
     process.env.GENERAL_CONTRACTING_MAX_POSTS ||
     50,
 );
+
+const TERM_DELAY_MIN_MS = Math.max(
+    2_000,
+    Number(process.env.COMBINATION_TERM_DELAY_MIN_MS || 5_000),
+);
+
+const TERM_DELAY_MAX_MS = Math.max(
+    TERM_DELAY_MIN_MS,
+    Number(process.env.COMBINATION_TERM_DELAY_MAX_MS || 9_000),
+);
+
+const DETAIL_WEIGHT_DELAY_MS = Math.max(
+    0,
+    Number(process.env.COMBINATION_DETAIL_WEIGHT_DELAY_MS || 1_500),
+);
+
+const DETAIL_WEIGHT_DELAY_CAP_MS = Math.max(
+    0,
+    Number(process.env.COMBINATION_DETAIL_WEIGHT_DELAY_CAP_MS || 12_000),
+);
 const FALLBACK_STATE =
     process.env.COMBINATION_FALLBACK_STATE ||
     process.env.GENERAL_CONTRACTING_FALLBACK_STATE ||
@@ -873,6 +893,177 @@ function cleanText(value = "") {
     return String(value).replace(/\s+/g, " ").trim();
 }
 
+function parseNextdoorPostTimestamp(value, now = new Date()) {
+    const raw = cleanText(value);
+    if (!raw) return null;
+
+    const lower = raw.toLowerCase();
+    const date = new Date(now);
+
+    if (/^today$/i.test(raw)) {
+        return date.toISOString();
+    }
+
+    if (/^yesterday$/i.test(raw)) {
+        date.setDate(date.getDate() - 1);
+        return date.toISOString();
+    }
+
+    let match = lower.match(/^(\d+)\s*(?:min|mins|minute|minutes)\s*ago$/i);
+    if (match) {
+        date.setMinutes(date.getMinutes() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = lower.match(/^(\d+)\s*(?:hr|hrs|hour|hours)\s*ago$/i);
+    if (match) {
+        date.setHours(date.getHours() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = lower.match(/^(\d+)\s*(?:d|day|days)\s*(?:ago)?$/i);
+    if (match) {
+        date.setDate(date.getDate() - Number(match[1]));
+        return date.toISOString();
+    }
+
+    match = raw.match(/^(\d{1,2})\s+([A-Za-z]{3,9})(?:\s+(\d{4}))?$/);
+    if (match) {
+        const day = Number(match[1]);
+        const monthName = match[2];
+        let year = match[3] ? Number(match[3]) : now.getFullYear();
+        let parsed = new Date(
+            monthName + " " + day + ", " + year + " 12:00:00"
+        );
+
+        if (Number.isNaN(parsed.getTime())) {
+            return null;
+        }
+
+        if (!match[3] && parsed.getTime() > now.getTime() + 7 * 86400000) {
+            year -= 1;
+            parsed = new Date(
+                monthName + " " + day + ", " + year + " 12:00:00"
+            );
+        }
+
+        return Number.isNaN(parsed.getTime())
+            ? null
+            : parsed.toISOString();
+    }
+
+    return null;
+}
+
+function normalizeDuplicateText(value) {
+    return cleanText(value || "")
+        .toLowerCase()
+        .replace(/[“”"‘’']/g, "")
+        .replace(/[^a-z0-9]+/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function descriptionsLookLikeSamePost(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    if (!a || !b) return false;
+    if (a === b) return true;
+
+    const shorter = a.length <= b.length ? a : b;
+    const longer = a.length <= b.length ? b : a;
+
+    if (shorter.length >= 30 && longer.includes(shorter)) {
+        return true;
+    }
+
+    const tokensA = new Set(
+        a.split(" ").filter((token) => token.length >= 3),
+    );
+    const tokensB = new Set(
+        b.split(" ").filter((token) => token.length >= 3),
+    );
+
+    if (!tokensA.size || !tokensB.size) {
+        return false;
+    }
+
+    let overlap = 0;
+
+    for (const token of tokensA) {
+        if (tokensB.has(token)) overlap += 1;
+    }
+
+    const smallerTokenCount = Math.min(tokensA.size, tokensB.size);
+
+    return (
+        smallerTokenCount >= 5 &&
+        overlap / smallerTokenCount >= 0.82
+    );
+}
+
+function authorsCompatibleForDuplicate(left, right) {
+    const a = normalizeDuplicateText(left);
+    const b = normalizeDuplicateText(right);
+
+    if (!a || !b) {
+        return true;
+    }
+
+    return a === b;
+}
+
+function isCrossTermDuplicate(seenDuringRun, item) {
+    const url = normalizePostUrl(item.url || item.post_url);
+    const description =
+        item.preview || item.text || item.description || "";
+
+    const priorItems = seenDuringRun.get(url) || [];
+
+    const duplicate = priorItems.some((prior) =>
+        authorsCompatibleForDuplicate(prior.author, item.author) &&
+        descriptionsLookLikeSamePost(prior.description, description)
+    );
+
+    if (duplicate) {
+        return true;
+    }
+
+    if (priorItems.length > 0) {
+        console.warn(
+            `⚠️ Same-run reused/mismatched URL not treated as cross-term duplicate: ${url}`,
+        );
+    }
+
+    priorItems.push({
+        author: item.author || null,
+        description,
+    });
+
+    seenDuringRun.set(url, priorItems);
+    return false;
+}
+
+function getAdaptiveTermDelayMs(result = {}) {
+    const baseRange = Math.max(
+        0,
+        TERM_DELAY_MAX_MS - TERM_DELAY_MIN_MS,
+    );
+
+    const base =
+        TERM_DELAY_MIN_MS +
+        Math.floor(Math.random() * (baseRange + 1));
+
+    const detailLoad = Math.min(
+        DETAIL_WEIGHT_DELAY_CAP_MS,
+        Math.max(0, Number(result.newCandidates || 0)) *
+            DETAIL_WEIGHT_DELAY_MS,
+    );
+
+    return base + detailLoad;
+}
+
 function normalizePostUrl(url) {
     try {
         const parsed = new URL(url);
@@ -1389,14 +1580,17 @@ async function applyDistanceFilter(page, targetMiles = 15) {
 async function applyDateFilter(page, targetLabel = "Today") {
     console.log(`🗓️ Applying "${targetLabel}" date filter...`);
 
+    const anyDateLabel =
+        /^(All Time|Today|This Week|This Month|This Year)$/i;
+    const targetRegex = targetLabel === "This Week"
+        ? /^This Week$/i
+        : /^Today$/i;
+
     const triggerCandidates = [
-        page.getByRole("button", {
-            name: /^(All Time|Today|This Week|This Month|This Year)$/i,
-        }).first(),
-        page.locator("button, [role=button]")
-            .filter({
-                hasText: /^(All Time|Today|This Week|This Month|This Year)$/i,
-            })
+        page.getByRole("button", { name: anyDateLabel }).first(),
+        page
+            .locator("button, [role=button]")
+            .filter({ hasText: anyDateLabel })
             .first(),
     ];
 
@@ -1413,47 +1607,68 @@ async function applyDateFilter(page, targetLabel = "Today") {
     }
 
     if (!trigger) {
-        console.log("ℹ️ Could not find the date filter.");
-        return false;
+        throw new Error(
+            `DATE_FILTER_NOT_FOUND: ${targetLabel}`,
+        );
     }
 
-    const currentText = cleanText(
+    const before = cleanText(
         await trigger.innerText().catch(() => "")
     );
 
-    if (currentText.toLowerCase() === targetLabel.toLowerCase()) {
-        console.log(`✅ Date already set to "${targetLabel}".`);
-        return true;
-    }
+    if (!targetRegex.test(before)) {
+        await trigger.click();
+        await sleep(500);
 
-    await trigger.click();
-    await sleep(500);
+        const optionCandidates = [
+            page.getByRole("menuitem", { name: targetRegex }).first(),
+            page.getByRole("option", { name: targetRegex }).first(),
+            page.getByText(targetRegex).last(),
+        ];
 
-    const targetRegex = new RegExp(`^${targetLabel}$`, "i");
+        let clicked = false;
 
-    const optionCandidates = [
-        page.getByRole("menuitem", { name: targetRegex }).first(),
-        page.getByRole("option", { name: targetRegex }).first(),
-        page.getByText(targetRegex).last(),
-    ];
-
-    for (const option of optionCandidates) {
-        if (
-            (await option.count().catch(() => 0)) &&
-            (await option.isVisible().catch(() => false))
-        ) {
-            await option.click();
-            await sleep(1_000);
-
-            console.log(`✅ Applied "${targetLabel}".`);
-            return true;
+        for (const option of optionCandidates) {
+            if (
+                (await option.count().catch(() => 0)) &&
+                (await option.isVisible().catch(() => false))
+            ) {
+                await option.click();
+                clicked = true;
+                break;
+            }
         }
+
+        if (!clicked) {
+            throw new Error(
+                `DATE_FILTER_OPTION_NOT_FOUND: ${targetLabel}`,
+            );
+        }
+
+        await sleep(1_200);
     }
 
-    console.log(`⚠️ "${targetLabel}" option not found.`);
-    return false;
-}
+    const verifyTrigger = page
+        .locator("button, [role=button]")
+        .filter({ hasText: anyDateLabel })
+        .first();
 
+    const after = cleanText(
+        await verifyTrigger.innerText().catch(() => "")
+    );
+
+    if (!targetRegex.test(after)) {
+        throw new Error(
+            `DATE_FILTER_NOT_APPLIED: expected ${targetLabel}, saw "${after || "unknown"}"`,
+        );
+    }
+
+    console.log(
+        `✅ Visible Nextdoor date filter verified: ${targetLabel}`,
+    );
+
+    return true;
+}
 
 async function applySearchFiltersByUrl(page, query) {
     const currentUrl = new URL(page.url());
@@ -1590,65 +1805,39 @@ async function searchNextdoor(page, query) {
         `${filterConfig.miles} miles + ${filterConfig.dateLabel}`
     );
 
-    // First attempt: Apply filters through Nextdoor's URL.
-    // Preserve Nextdoor-generated search parameters.
-    // If URL filtering fails, use the visible filter controls.
+    // Use URL parameters for navigation, but do not trust them as proof
+    // that Nextdoor actually applied the requested result window.
     try {
         await applySearchFiltersByUrl(page, query);
-
-        console.log(
-            `✅ URL filters applied for "${query}": ` +
-            `${filterConfig.miles} miles + ${filterConfig.dateLabel}`
-        );
-
     } catch (error) {
         console.warn(
-            `⚠️ URL filters failed for "${query}": ${error.message}`
-        );
-
-        console.log(
-            "♻️ Falling back to the visible Posts and filter controls..."
-        );
-
-        // Open the Posts results.
-        await goToPostsTab(page, query);
-
-        // Apply Most Recent sorting.
-        await applyMostRecentFilter(page);
-
-        // Apply the category-specific search radius.
-        const distanceApplied = await applyDistanceFilter(
-            page,
-            filterConfig.miles
-        );
-
-        if (!distanceApplied) {
-            throw new Error(
-                `Could not apply ${filterConfig.miles}-mile distance filter ` +
-                `for "${query}".`
-            );
-        }
-
-        // Apply Today or This Week depending on category.
-        const dateApplied = await applyDateFilter(
-            page,
-            filterConfig.dateLabel
-        );
-
-        if (!dateApplied) {
-            throw new Error(
-                `Could not apply "${filterConfig.dateLabel}" date filter ` +
-                `for "${query}".`
-            );
-        }
-
-        await sleep(1_800);
-
-        console.log(
-            `✅ Fallback filters applied for "${query}": ` +
-            `${filterConfig.miles} miles + ${filterConfig.dateLabel}`
+            `⚠️ URL filter navigation failed for "${query}": ${error.message}`
         );
     }
+
+    // Physically set and verify the visible controls before collecting cards.
+    await goToPostsTab(page, query);
+    await applyMostRecentFilter(page);
+
+    const distanceApplied = await applyDistanceFilter(
+        page,
+        filterConfig.miles
+    );
+
+    if (!distanceApplied) {
+        throw new Error(
+            `DISTANCE_FILTER_NOT_APPLIED:${filterConfig.miles} miles:${query}`
+        );
+    }
+
+    await applyDateFilter(page, filterConfig.dateLabel);
+    await sleep(1_800);
+
+    console.log(
+        `✅ Visible filters verified for "${query}": ` +
+        `${filterConfig.miles} miles + ${filterConfig.dateLabel}`
+    );
+
     const throttle = await detectNextdoorThrottle(page);
 
     if (throttle) {
@@ -1689,78 +1878,252 @@ async function collectPostLinks(page, limit = MAX_POSTS_PER_TERM) {
 
     const raw = await page.evaluate((maxResults) => {
         const results = [];
-        const seen = new Set();
+        const clean = (value) =>
+            (value || "").replace(/\s+/g, " ").trim();
 
         for (const anchor of document.querySelectorAll(
             'a[href*="/p/"], a[href*="/posting/"]',
         )) {
             const href = anchor.href;
-
-            if (!href || seen.has(href)) continue;
+            if (!href) continue;
 
             const root =
                 anchor.closest("article, [role=article], li") ||
                 anchor.parentElement;
 
-            const preview = (
+            const preview = clean(
                 root?.innerText ||
                 anchor.innerText ||
                 ""
-            )
-                .replace(/\s+/g, " ")
-                .trim();
+            );
 
             if (preview.length < 15) continue;
 
-            seen.add(href);
+            let author = null;
+
+            const avatar = root?.querySelector(
+                '[aria-label*="Avatar for" i]'
+            );
+
+            const avatarLabel =
+                avatar?.getAttribute("aria-label") || "";
+
+            if (avatarLabel) {
+                author = clean(
+                    avatarLabel.replace(/^Avatar for\s*/i, "")
+                );
+            }
+
+            if (!author) {
+                const profileLink = root?.querySelector(
+                    'a[href*="/profile/"]'
+                );
+
+                const profileText = clean(profileLink?.textContent);
+
+                if (
+                    profileText &&
+                    profileText.length <= 100
+                ) {
+                    author = profileText;
+                }
+            }
+
+            let location = null;
+            let postedAtText = null;
+
+            const styledTexts = [
+                ...(root?.querySelectorAll(
+                    '[data-testid="styled-text"]'
+                ) || []),
+            ]
+                .map((element) => clean(element.textContent))
+                .filter(Boolean);
+
+            for (const text of styledTexts) {
+                const match = text.match(
+                    /^(.+?),\s*([A-Z]{2})\s*·\s*([^·]+)(?:\s*·|$)/i,
+                );
+
+                if (match) {
+                    location =
+                        clean(match[1]) + ", " + match[2].toUpperCase();
+                    postedAtText = clean(match[3]);
+                    break;
+                }
+
+                const locationOnly = text.match(
+                    /^(.+?),\s*([A-Z]{2})\s*·\s*/i,
+                );
+
+                if (locationOnly && !location) {
+                    location =
+                        clean(locationOnly[1]) +
+                        ", " +
+                        locationOnly[2].toUpperCase();
+                }
+            }
 
             results.push({
                 url: href,
                 preview: preview.slice(0, 1_500),
+                author: author || null,
+                location: location || null,
+                posted_at_text: postedAtText || null,
             });
 
-            if (results.length >= maxResults) break;
+            if (results.length >= maxResults * 3) break;
         }
 
         return results;
     }, limit);
 
-    const unique = new Map();
+    const posts = [];
+    const collectedByUrl = new Map();
+    let sameCardDuplicates = 0;
+    let reusedUrlVariants = 0;
 
-    for (const post of raw) {
-        const normalizedUrl = normalizePostUrl(post.url);
+    for (const rawPost of raw) {
+        const post = {
+            ...rawPost,
+            url: normalizePostUrl(rawPost.url),
+        };
 
-        unique.set(normalizedUrl, {
-            ...post,
-            url: normalizedUrl,
-        });
+        const priorPosts = collectedByUrl.get(post.url) || [];
+
+        const duplicate = priorPosts.some((prior) =>
+            authorsCompatibleForDuplicate(
+                prior.author,
+                post.author,
+            ) &&
+            descriptionsLookLikeSamePost(
+                prior.preview,
+                post.preview,
+            )
+        );
+
+        if (duplicate) {
+            sameCardDuplicates += 1;
+            continue;
+        }
+
+        if (priorPosts.length > 0) {
+            reusedUrlVariants += 1;
+            console.warn(
+                `⚠️ Same search returned one URL with different card content: ${post.url}`,
+            );
+        }
+
+        priorPosts.push(post);
+        collectedByUrl.set(post.url, priorPosts);
+        posts.push(post);
+
+        if (posts.length >= limit) break;
     }
 
-    const posts = [...unique.values()];
+    console.log(
+        `🔗 Found ${posts.length} distinct post card(s); ` +
+        `${sameCardDuplicates} duplicate anchor/card(s) collapsed; ` +
+        `${reusedUrlVariants} reused-URL variant(s) preserved.`,
+    );
 
-    console.log(`🔗 Found ${posts.length} unique posts.`);
     return posts;
 }
 
+const OTHER_LEAD_TABLE = "unfiltered_general_contracting";
+
 async function getExistingUrls(posts) {
-    const urls = posts.map((post) => normalizePostUrl(post.url));
+    const urls = posts
+        .map((post) => normalizePostUrl(post.url))
+        .filter(Boolean);
 
     if (!urls.length) return new Set();
 
     const { rows } = await pool.query(
         `
-            SELECT post_url
+            SELECT
+                post_url,
+                author,
+                description,
+                'current'::text AS source
             FROM ${TABLE_NAME}
+            WHERE post_url = ANY($1::text[])
+
+            UNION ALL
+
+            SELECT
+                post_url,
+                author,
+                description,
+                'other'::text AS source
+            FROM ${OTHER_LEAD_TABLE}
             WHERE post_url = ANY($1::text[])
         `,
         [urls],
     );
 
-    return new Set(
-        rows.map((row) => normalizePostUrl(row.post_url)),
-    );
-}
+    const postsByUrl = new Map();
 
+    for (const post of posts) {
+        const url = normalizePostUrl(post.url);
+
+        if (!postsByUrl.has(url)) {
+            postsByUrl.set(url, []);
+        }
+
+        postsByUrl.get(url).push(post);
+    }
+
+    const existingUrls = new Set();
+    let crossTableMatches = 0;
+    let reusedUrlMismatches = 0;
+
+    for (const row of rows) {
+        const url = normalizePostUrl(row.post_url);
+
+        // The destination table owns post_url. Never allow a second record
+        // with that URL to overwrite the existing row through ON CONFLICT.
+        if (row.source === "current") {
+            existingUrls.add(url);
+            continue;
+        }
+
+        const candidates = postsByUrl.get(url) || [];
+
+        const samePost = candidates.some((post) =>
+            authorsCompatibleForDuplicate(
+                row.author,
+                post.author,
+            ) &&
+            descriptionsLookLikeSamePost(
+                row.description,
+                post.preview,
+            )
+        );
+
+        if (samePost) {
+            existingUrls.add(url);
+            crossTableMatches += 1;
+        } else {
+            reusedUrlMismatches += 1;
+        }
+    }
+
+    if (crossTableMatches > 0) {
+        console.log(
+            `🧱 Cross-table historical duplicate matches: ${crossTableMatches}.`,
+        );
+    }
+
+    if (reusedUrlMismatches > 0) {
+        console.warn(
+            `⚠️ Reused/mismatched historical URL(s) not treated as duplicates: ` +
+            `${reusedUrlMismatches}.`,
+        );
+    }
+
+    return existingUrls;
+}
 
 async function purgeExpiredSearchHistory() {
     const resultDelete = await pool.query(
@@ -2161,6 +2524,8 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         state: cityState.state,
         lead_type: leadTypes,
         search_term: searchTerm,
+        posted_at_text: post.posted_at_text || null,
+        posted_at: parseNextdoorPostTimestamp(post.posted_at_text),
     };
 }
 
@@ -2178,7 +2543,10 @@ async function insertUnfilteredGeneralContracting(record) {
             lead_type,
             timestamp
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7::text[], NOW())
+        VALUES (
+            $1, $2, $3, $4, $5, $6, $7::text[],
+            COALESCE($8::timestamp, NOW())
+        )
             ON CONFLICT (post_url) DO UPDATE SET
             author = COALESCE(
                                           EXCLUDED.author,
@@ -2228,6 +2596,7 @@ async function insertUnfilteredGeneralContracting(record) {
         Array.isArray(record.lead_type)
             ? record.lead_type
             : [record.lead_type],
+        record.posted_at || null,
     ]);
 
     console.log(
@@ -2444,12 +2813,11 @@ async function processSearchTerm({
     for (const post of allPosts) {
         const url = normalizePostUrl(post.url);
 
-        if (seenDuringRun.has(url)) {
+        if (isCrossTermDuplicate(seenDuringRun, post)) {
             crossTermUrls.add(url);
             continue;
         }
 
-        seenDuringRun.add(url);
         uniqueForThisRun.push(post);
     }
 
@@ -2816,7 +3184,7 @@ async function main() {
         await closeStaleContextPages(context, bootstrapPage);
         await parkBootstrapPage(bootstrapPage);
 
-        const seenDuringRun = new Set();
+        const seenDuringRun = new Map();
 
         const carryoverTerms =
             await fetchCarryoverSearchTerms();
@@ -2893,6 +3261,9 @@ async function main() {
         ) {
             const query =
                 executionPlan[termIndex];
+
+            let lastTermResult = null;
+
             if (
                 browserDisconnected ||
                 !browser.isConnected()
@@ -2909,6 +3280,8 @@ async function main() {
                     runId,
                     seenDuringRun,
                 });
+
+                lastTermResult = result;
 
                 totalResultObservations +=
                     result.resultObservations;
@@ -3000,7 +3373,15 @@ async function main() {
                 totalFailed += 1;
             }
 
-            await sleep(1_000);
+            const interTermDelayMs =
+                getAdaptiveTermDelayMs(lastTermResult || {});
+
+            console.log(
+                `🕒 Pacing before next term: ${Math.round(interTermDelayMs / 1000)}s ` +
+                `(${lastTermResult?.newCandidates || 0} new detail candidate(s)).`,
+            );
+
+            await sleep(interTermDelayMs);
         }
 
         await finishSearchRun(
