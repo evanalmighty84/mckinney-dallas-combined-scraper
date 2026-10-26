@@ -2525,7 +2525,11 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         lead_type: leadTypes,
         search_term: searchTerm,
         posted_at_text: post.posted_at_text || null,
-        posted_at: parseNextdoorPostTimestamp(post.posted_at_text),
+        posted_at: (() => {
+            const parsed = parseNextdoorPostTimestamp(post.posted_at_text);
+            if (!parsed || new Date(parsed).getTime() > Date.now() + 60_000) return null;
+            return parsed;
+        })(),
     };
 }
 
@@ -2541,11 +2545,15 @@ async function insertUnfilteredGeneralContracting(record) {
             city,
             state,
             lead_type,
-            timestamp
+            timestamp,
+            original_post_at,
+            posted_at_text
         )
         VALUES (
             $1, $2, $3, $4, $5, $6, $7::text[],
-            COALESCE($8::timestamp, NOW())
+            COALESCE($8::timestamp, NOW()),
+            $9::timestamptz,
+            $10::text
         )
             ON CONFLICT (post_url) DO UPDATE SET
             author = COALESCE(
@@ -2582,7 +2590,9 @@ async function insertUnfilteredGeneralContracting(record) {
                                           ) AS value
                                           WHERE value IS NOT NULL
                                           AND BTRIM(value) <> ''
-                                          )
+                                          ),
+            original_post_at = COALESCE(EXCLUDED.original_post_at, ${TABLE_NAME}.original_post_at),
+            posted_at_text = COALESCE(EXCLUDED.posted_at_text, ${TABLE_NAME}.posted_at_text)
                                           RETURNING id
     `;
 
@@ -2597,6 +2607,8 @@ async function insertUnfilteredGeneralContracting(record) {
             ? record.lead_type
             : [record.lead_type],
         record.posted_at || null,
+        record.posted_at || null,
+        record.posted_at_text || null,
     ]);
 
     console.log(
