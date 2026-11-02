@@ -761,6 +761,9 @@ async function configurePage(page, label) {
 
         const responseUrl = response.url();
 
+        if (/nextdoor\\.com\\/search/i.test(responseUrl)) {
+            page.__nextdoorSearchRateLimited = true;
+        }
         if (/nextdoor\.com\/search/i.test(responseUrl)) {
             console.error(
                 `🌐 HTTP 429 (${label}): ${responseUrl}`,
@@ -1503,7 +1506,21 @@ async function applyDistanceFilter(page, targetMiles = 15) {
     }
 
     if (!trigger) {
-        console.log("ℹ️ Could not find the distance control.");
+        // Search filters can hydrate after the Posts view has appeared.
+        for (let attempt = 0; attempt < 5 && !trigger; attempt += 1) {
+            if (page.__nextdoorSearchRateLimited) return false;
+            await sleep(1_000);
+            for (const candidate of triggerCandidates) {
+                if ((await candidate.count().catch(() => 0)) &&
+                    (await candidate.isVisible().catch(() => false))) {
+                    trigger = candidate;
+                    break;
+                }
+            }
+        }
+    }
+    if (!trigger) {
+        console.log("ℹ️ Could not find the distance control after waiting for hydration.");
         return false;
     }
 
@@ -1817,12 +1834,20 @@ async function searchNextdoor(page, query) {
 
     // Physically set and verify the visible controls before collecting cards.
     await goToPostsTab(page, query);
+    if (page.__nextdoorSearchRateLimited) {
+        throw new Error(`NEXTDOOR_THROTTLED:120:${query}`);
+    }
+
     await applyMostRecentFilter(page);
 
     const distanceApplied = await applyDistanceFilter(
         page,
         filterConfig.miles
     );
+
+    if (page.__nextdoorSearchRateLimited) {
+        throw new Error(`NEXTDOOR_THROTTLED:120:${query}`);
+    }
 
     if (!distanceApplied) {
         throw new Error(
@@ -2224,9 +2249,20 @@ async function logSearchObservations({
     const values = [];
     const placeholders = [];
 
+    // Audit rows are uniquely keyed by URL. Multiple cards can still be
+    // processed downstream, but inserting the same conflict key twice in one
+    // PostgreSQL statement fails with SQLSTATE 21000.
+    const auditedUrls = new Set();
+    let repeatedAuditUrls = 0;
     posts.forEach((post, index) => {
         const base = values.length;
         const postUrl = normalizePostUrl(post.url);
+        if (auditedUrls.has(postUrl)) {
+            repeatedAuditUrls += 1;
+            return;
+        }
+        auditedUrls.add(postUrl);
+
 
         values.push(
             runId,
@@ -2246,6 +2282,10 @@ async function logSearchObservations({
             `$${base + 7}, $${base + 8}, $${base + 9})`,
         );
     });
+
+    if (repeatedAuditUrls > 0) {
+        console.warn(`🧾 Search audit: ${repeatedAuditUrls} additional card variant(s) share a URL; audit stores one row per URL, while candidate processing remains unchanged.`);
+    }
 
     await pool.query(
         `
