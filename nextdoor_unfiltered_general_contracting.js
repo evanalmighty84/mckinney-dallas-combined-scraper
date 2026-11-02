@@ -761,7 +761,7 @@ async function configurePage(page, label) {
 
         const responseUrl = response.url();
 
-        if (/nextdoor\\.com\\/search/i.test(responseUrl)) {
+        if (/nextdoor\.com\/search/i.test(responseUrl)) {
             page.__nextdoorSearchRateLimited = true;
         }
         if (/nextdoor\.com\/search/i.test(responseUrl)) {
