@@ -2427,13 +2427,11 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         timeout: 45_000,
     });
 
-    await detailPage
-        .waitForURL(
-            (current) =>
-                normalizePostUrl(current.href) === url,
-            { timeout: 12_000 },
-        )
-        .catch(() => {});
+    // A redirect to another post makes any extracted content unsafe.
+    await detailPage.waitForURL(
+        (current) => normalizePostUrl(current.href) === url,
+        { timeout: 12_000 },
+    );
 
     await sleep(1_400);
     await expandSeeMore(detailPage);
@@ -2624,6 +2622,32 @@ async function extractPostDetails(detailPage, post, searchTerm) {
     };
 }
 
+
+// Quarantine descriptions repeatedly appearing under unrelated authors.
+// This is a safety net for search-card/detail-page mismatches; legitimate
+// shared posts can be reviewed instead of silently reaching paid alerts.
+async function hasSuspiciousDescriptionReuse(record) {
+    if (!record.description || record.description.length < 120) {
+        return false;
+    }
+    const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT LOWER(BTRIM(author))) AS other_authors
+         FROM (
+             SELECT author, post_url
+             FROM ${TABLE_NAME}
+             WHERE description = $1
+             UNION ALL
+             SELECT author, post_url
+             FROM ${OTHER_LEAD_TABLE}
+             WHERE description = $1
+         ) prior
+         WHERE post_url <> $2
+           AND LOWER(BTRIM(COALESCE(author, ''))) <>
+               LOWER(BTRIM($3::text))`,
+        [record.description, record.post_url, record.author || ""],
+    );
+    return Number(rows[0]?.other_authors || 0) >= 2;
+}
 
 async function insertUnfilteredGeneralContracting(record) {
     const query = `
@@ -2995,6 +3019,21 @@ async function processSearchTerm({
                     "No usable description",
                 );
 
+                continue;
+            }
+
+            if (await hasSuspiciousDescriptionReuse(record)) {
+                failed += 1;
+                console.warn(
+                    "⚠️ Quarantined repeated description across different authors: " +
+                    record.post_url,
+                );
+                await markAuditError(
+                    runId,
+                    query,
+                    post.url,
+                    "Suspicious repeated description across unrelated authors",
+                );
                 continue;
             }
 
