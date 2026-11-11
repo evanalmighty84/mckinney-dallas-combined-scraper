@@ -1916,10 +1916,13 @@ async function collectPostLinks(page, limit = MAX_POSTS_PER_TERM) {
                 anchor.closest("article, [role=article], li") ||
                 anchor.parentElement;
 
+            // Only use an isolated post card. Falling back to a broad
+            // parent can combine unrelated posts into one preview.
+            if (!root || root === document.body || root === document.querySelector("main")) {
+                continue;
+            }
             const preview = clean(
-                root?.innerText ||
-                anchor.innerText ||
-                ""
+                root.innerText || anchor.innerText || ""
             );
 
             if (preview.length < 15) continue;
@@ -2424,13 +2427,11 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         timeout: 45_000,
     });
 
-    await detailPage
-        .waitForURL(
-            (current) =>
-                normalizePostUrl(current.href) === url,
-            { timeout: 12_000 },
-        )
-        .catch(() => {});
+    // A redirect to another post makes any extracted content unsafe.
+    await detailPage.waitForURL(
+        (current) => normalizePostUrl(current.href) === url,
+        { timeout: 12_000 },
+    );
 
     await sleep(1_400);
     await expandSeeMore(detailPage);
@@ -2497,10 +2498,53 @@ async function extractPostDetails(detailPage, post, searchTerm) {
 
             candidates.sort((a, b) => b.score - a.score);
 
-            const description =
-                candidates[0]?.text ||
-                clean(preview) ||
-                null;
+            // Search result preview acts as an independent anchor. Avoid
+            // selecting long, unrelated recommendations on detail pages.
+            const meaningfulWords = (value) =>
+                new Set(
+                    clean(value).toLowerCase()
+                        .split(/[^a-z0-9]+/)
+                        .filter((word) => word.length >= 4),
+                );
+            const previewWords = meaningfulWords(preview);
+            const ranked = candidates.map((candidate) => {
+                const bodyWords = meaningfulWords(candidate.text);
+                let common = 0;
+                for (const word of previewWords) {
+                    if (bodyWords.has(word)) common += 1;
+                }
+                return {
+                    ...candidate,
+                    common,
+                    coverage: previewWords.size
+                        ? common / previewWords.size
+                        : 0,
+                };
+            })
+                .filter((candidate) =>
+                    candidate.common >= 4 &&
+                    candidate.coverage >= 0.6
+                )
+                .sort((a, b) =>
+                    b.coverage - a.coverage ||
+                    b.common - a.common ||
+                    b.text.length - a.text.length
+                );
+
+            const normalizeBody = (value) =>
+                clean(value).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+            const best = ranked[0];
+            const ambiguous = Boolean(best && ranked.some((candidate) =>
+                candidate !== best &&
+                candidate.coverage >= best.coverage - 0.1 &&
+                !normalizeBody(candidate.text).includes(normalizeBody(best.text)) &&
+                !normalizeBody(best.text).includes(normalizeBody(candidate.text))
+            ));
+
+            // No fallback to the preview: if the detail page cannot be
+            // independently validated, skip this post instead of storing
+            // an unverified description.
+            const description = best && !ambiguous ? best.text : null;
 
             let location = null;
 
@@ -2540,9 +2584,14 @@ async function extractPostDetails(detailPage, post, searchTerm) {
         { preview: post.preview },
     );
 
-    const description = cleanText(
-        extracted.description || post.preview,
-    );
+    const description = cleanText(extracted.description);
+
+    if (!description) {
+        throw new Error(
+            "DETAIL_DESCRIPTION_MISMATCH: detail-page body does not " +
+            "reliably match the search-result card preview for " + url,
+        );
+    }
 
     const location = cleanText(
         extracted.location || "",
@@ -2573,6 +2622,32 @@ async function extractPostDetails(detailPage, post, searchTerm) {
     };
 }
 
+
+// Quarantine descriptions repeatedly appearing under unrelated authors.
+// This is a safety net for search-card/detail-page mismatches; legitimate
+// shared posts can be reviewed instead of silently reaching paid alerts.
+async function hasSuspiciousDescriptionReuse(record) {
+    if (!record.description || record.description.length < 120) {
+        return false;
+    }
+    const { rows } = await pool.query(
+        `SELECT COUNT(DISTINCT LOWER(BTRIM(author))) AS other_authors
+         FROM (
+             SELECT author, post_url
+             FROM ${TABLE_NAME}
+             WHERE description = $1
+             UNION ALL
+             SELECT author, post_url
+             FROM ${OTHER_LEAD_TABLE}
+             WHERE description = $1
+         ) prior
+         WHERE post_url <> $2
+           AND LOWER(BTRIM(COALESCE(author, ''))) <>
+               LOWER(BTRIM($3::text))`,
+        [record.description, record.post_url, record.author || ""],
+    );
+    return Number(rows[0]?.other_authors || 0) >= 2;
+}
 
 async function insertUnfilteredGeneralContracting(record) {
     const query = `
@@ -2944,6 +3019,21 @@ async function processSearchTerm({
                     "No usable description",
                 );
 
+                continue;
+            }
+
+            if (await hasSuspiciousDescriptionReuse(record)) {
+                failed += 1;
+                console.warn(
+                    "⚠️ Quarantined repeated description across different authors: " +
+                    record.post_url,
+                );
+                await markAuditError(
+                    runId,
+                    query,
+                    post.url,
+                    "Suspicious repeated description across unrelated authors",
+                );
                 continue;
             }
 
